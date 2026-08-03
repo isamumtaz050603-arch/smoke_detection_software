@@ -1,0 +1,21 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "C:\\Users\\skhad\\OneDrive\\Desktop\\Khadija\\datasets",
+  "weights_dir": "weights",
+  "runs_dir": "runs",
+  "uuid": "ecf2c7d1f95bcf46c4d18d895302c46df511e3ce25c97cab1e8b5b2e068caad4",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": true
+}

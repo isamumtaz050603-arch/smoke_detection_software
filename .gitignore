@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.streamlit/secrets.toml
+.env
+
+outputs/
+support/cache_files/
+support/old_runtime_files/
+
+models/florence2_smoke_classifier/*.bin
+models/florence2_smoke_classifier/*.safetensors
+
+~$*.docx
