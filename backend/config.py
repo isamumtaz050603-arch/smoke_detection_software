@@ -96,3 +96,4 @@ class DetectionConfig:
     video_analysis_fps: int = 10
     detector_image_size: int = 512
     report_interval_seconds: float = 1.0
+    tracker_type: str = "None"

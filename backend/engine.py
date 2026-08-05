@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 import torch
+import difflib
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 
 from .config import (
@@ -22,13 +24,23 @@ class SmokeDetectionEngine:
     Main AI engine.
     It keeps the loaded models and current settings together.
     """
-    def __init__(self, detector_model, classifier_model, classifier_processor, inference_device, use_half_precision, config):
+    def __init__(self, detector_model, classifier_model, classifier_processor, inference_device, use_half_precision, config, vehicle_model=None, license_plate_model=None, ocr_reader=None):
         self.detector_model = detector_model
         self.classifier_model = classifier_model
         self.classifier_processor = classifier_processor
         self.inference_device = inference_device
         self.use_half_precision = use_half_precision
         self.config = config
+        self.vehicle_model = vehicle_model
+        self.license_plate_model = license_plate_model
+        self.ocr_reader = ocr_reader
+        
+        # Dual-Layer Tracking state
+        self.global_vehicle_map = {} # Plate Text -> Master Track ID
+        self.local_to_master_id = {} # Local YOLO ID -> Master Track ID
+        self.unreadable_cache = set() # Master Track IDs that failed ANPR
+        import collections
+        self.track_history_buffer = collections.defaultdict(lambda: collections.deque(maxlen=30))
 
     def prepare_florence_inputs(self, inputs):
         """
@@ -99,6 +111,240 @@ class SmokeDetectionEngine:
             )
 
         return remove_nested_smoke_boxes(detections)
+
+    # ------------------------------------------------------------------
+    # Tracking: YOLO tracks vehicles (ByteTrack / BoT-SORT).
+    # ------------------------------------------------------------------
+    def track_vehicles(self, frame_bgr):
+        """
+        Runs tracking for vehicles.
+        Returns a list of dictionaries with vehicle boxes and track IDs.
+        """
+        if not self.vehicle_model or self.config.tracker_type not in ["ByteTrack", "BoT-SORT"]:
+            return []
+
+        tracker_yaml = "models/custom_bytetrack.yaml" if self.config.tracker_type == "ByteTrack" else "models/custom_botsort.yaml"
+        # COCO vehicle classes: 2: car, 3: motorcycle, 5: bus, 7: truck
+        try:
+            results = self.vehicle_model.track(
+                frame_bgr,
+                persist=True,
+                tracker=tracker_yaml,
+                classes=[2, 3, 5, 7],
+                verbose=False,
+                conf=0.15, # Lower confidence to track obscured vehicles
+                iou=0.45
+            )
+        except Exception:
+            return []
+
+        if not results or not results[0].boxes or results[0].boxes.id is None:
+            return []
+
+        boxes = results[0].boxes
+        tracks = []
+        for box in boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+            local_id = int(box.id.item())
+            class_id = int(box.cls.item())
+            class_name = self.vehicle_model.names.get(class_id, "Vehicle")
+            
+            box_width = x2 - x1
+            box_height = y2 - y1
+            
+            master_id = self.local_to_master_id.get(local_id)
+            
+            if master_id is None:
+                # Fallback to local_id immediately to prevent tracking drops
+                master_id = local_id 
+                self.local_to_master_id[local_id] = local_id
+                
+            # Save state to rolling 30-frame buffer for temporal lookback
+            vehicle_crop = frame_bgr[y1:y2, x1:x2].copy()
+            self.track_history_buffer[master_id].append({
+                'crop': vehicle_crop,
+                'bbox': [x1, y1, x2, y2],
+                'class_name': class_name
+            })
+
+            tracks.append({
+                "xyxy": [x1, y1, x2, y2],
+                "track_id": master_id,
+                "class_name": class_name,
+            })
+        return tracks
+
+    def get_plate_for_track(self, track_id):
+        """
+        Attempts ANPR on the current and past 5 crops of a track_id.
+        Returns the recognized plate text, or 'UNREADABLE'.
+        """
+        if not self.license_plate_model or not self.ocr_reader:
+            return "UNREADABLE"
+
+        # FAST PATH CACHE: Return immediately if we already know the plate
+        for known_plate, master_id in self.global_vehicle_map.items():
+            if master_id == track_id:
+                return known_plate
+
+        # UNREADABLE CACHE: Don't repeatedly scan tracks that already failed
+        if track_id in self.unreadable_cache:
+            return "UNREADABLE"
+
+        # Search backwards (most recent frame first), limit to 5 frames
+        history = list(self.track_history_buffer.get(track_id, []))
+        history_to_check = history[-5:] if len(history) >= 5 else history
+        
+        for entry in reversed(history_to_check):
+            vehicle_crop = entry['crop']
+            if vehicle_crop.size == 0:
+                continue
+                
+            plate_results = self.license_plate_model.predict(vehicle_crop, verbose=False)
+            if not plate_results or not plate_results[0].boxes:
+                continue
+                
+            # Take the highest confidence plate box
+            best_plate_box = max(plate_results[0].boxes, key=lambda b: float(b.conf.item()))
+            
+            # Confidence threshold guard
+            if float(best_plate_box.conf.item()) <= 0.45:
+                continue
+                
+            px1, py1, px2, py2 = map(int, best_plate_box.xyxy[0].cpu().numpy())
+            plate_crop = vehicle_crop[py1:py2, px1:px2]
+            
+            ocr_results = self.ocr_reader.readtext(plate_crop, detail=0)
+            if not ocr_results:
+                continue
+                
+            # Join text if multiple blocks are found
+            plate_text = "".join(ocr_results).replace(" ", "").upper()
+            if len(plate_text) >= 3:
+                # Fuzzy Match
+                best_match = None
+                best_ratio = 0.0
+                
+                for known_plate, master_id in self.global_vehicle_map.items():
+                    ratio = difflib.SequenceMatcher(None, plate_text, known_plate).ratio()
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_match = master_id
+                        
+                if best_ratio > 0.85:
+                    # It's an existing vehicle (link broken tracks)
+                    self.local_to_master_id[track_id] = best_match
+                    return known_plate
+                else:
+                    # It's a new vehicle
+                    self.global_vehicle_map[plate_text] = track_id
+                    return plate_text
+                    
+        self.unreadable_cache.add(track_id)
+        return "UNREADABLE"
+
+    # ------------------------------------------------------------------
+    # Association: Link Smoke to Vehicles
+    # ------------------------------------------------------------------
+    def associate_smoke_to_vehicles(self, smoke_detections, vehicle_tracks):
+        """
+        Associates smoke boxes to master vehicle IDs based on a Spatial Composite Score.
+        """
+        for smoke in smoke_detections:
+            smoke['associated_master_id'] = None
+            smoke['associated_class_name'] = None
+            smoke['associated_plate'] = None
+            
+            sx1, sy1, sx2, sy2 = smoke['xyxy']
+            smoke_area = float((sx2 - sx1) * (sy2 - sy1))
+            if smoke_area <= 0:
+                continue
+                
+            sx_mid = (sx1 + sx2) / 2.0
+            sy_min = sy1 # top of smoke
+            
+            best_score = 0.0
+            best_master_id = None
+            best_class_name = None
+            
+            for vehicle in vehicle_tracks:
+                vx1, vy1, vx2, vy2 = vehicle['xyxy']
+                
+                # Expand vehicle box aggressively to cover exhaust zones and trailing smoke
+                vx1_expanded = vx1 - 150
+                vy1_expanded = vy1 - 50
+                vx2_expanded = vx2 + 150
+                vy2_expanded = vy2 + 150
+                
+                # Calculate Intersection with expanded box
+                ix1 = max(sx1, vx1_expanded)
+                iy1 = max(sy1, vy1_expanded)
+                ix2 = min(sx2, vx2_expanded)
+                iy2 = min(sy2, vy2_expanded)
+                
+                intersection_area = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                ios = intersection_area / smoke_area
+                
+                # Box-to-Box distance (shortest distance between the two bounding boxes)
+                dx = max(0.0, vx1 - sx2, sx1 - vx2)
+                dy = max(0.0, vy1 - sy2, sy1 - vy2)
+                box_distance = np.sqrt(dx**2 + dy**2)
+                
+                composite_score = (0.6 * ios) + (0.4 * (1.0 / (1.0 + (box_distance / 10.0))))
+                
+                if composite_score > best_score and composite_score > 0.20:
+                    best_score = composite_score
+                    best_master_id = vehicle['track_id']
+                    best_class_name = vehicle['class_name']
+            
+            if best_master_id is not None:
+                smoke['associated_master_id'] = best_master_id
+                smoke['associated_class_name'] = best_class_name
+            else:
+                # Temporal Vehicle Association Fallback
+                fallback_best_score = 0.0
+                fallback_master_id = None
+                fallback_class_name = None
+                
+                for master_id, history in self.track_history_buffer.items():
+                    for entry in reversed(list(history)):
+                        vx1, vy1, vx2, vy2 = entry['bbox']
+                        vx1_expanded = vx1 - 150
+                        vy1_expanded = vy1 - 50
+                        vx2_expanded = vx2 + 150
+                        vy2_expanded = vy2 + 150
+                        
+                        ix1 = max(sx1, vx1_expanded)
+                        iy1 = max(sy1, vy1_expanded)
+                        ix2 = min(sx2, vx2_expanded)
+                        iy2 = min(sy2, vy2_expanded)
+                        
+                        intersection_area = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                        ios = intersection_area / smoke_area
+                        
+                        dx = max(0.0, vx1 - sx2, sx1 - vx2)
+                        dy = max(0.0, vy1 - sy2, sy1 - vy2)
+                        box_distance = np.sqrt(dx**2 + dy**2)
+                        
+                        composite_score = (0.6 * ios) + (0.4 * (1.0 / (1.0 + (box_distance / 10.0))))
+                        
+                        if composite_score > fallback_best_score and composite_score > 0.15:
+                            fallback_best_score = composite_score
+                            fallback_master_id = master_id
+                            fallback_class_name = entry['class_name']
+                            break # Move to next master_id since we found best match in its history
+                            
+                if fallback_master_id is not None:
+                    smoke['associated_master_id'] = fallback_master_id
+                    smoke['associated_class_name'] = fallback_class_name
+            
+            if smoke['associated_master_id'] is not None:
+                for plate_text, master_id in self.global_vehicle_map.items():
+                    if master_id == smoke['associated_master_id']:
+                        smoke['associated_plate'] = plate_text
+                        break
+                        
+        return smoke_detections
 
     # ------------------------------------------------------------------
     # Classification: Florence decides smoke color from the crop caption.

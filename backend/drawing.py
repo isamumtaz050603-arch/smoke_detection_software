@@ -91,3 +91,42 @@ def draw_fast_video_detections(frame_bgr, detections):
         )
 
     return annotated
+
+def draw_vehicle_tracks(frame_bgr, tracks, emitting_master_ids=None):
+    """Draws blue boxes and track IDs for tracked vehicles. Highlights emitting vehicles in Red."""
+    if not tracks:
+        return frame_bgr
+
+    if emitting_master_ids is None:
+        emitting_master_ids = set()
+
+    annotated = frame_bgr.copy()
+    normal_color = (255, 100, 0) # Blue
+    emitting_color = (0, 0, 255) # Red
+
+    for track in tracks:
+        x1, y1, x2, y2 = track["xyxy"]
+        track_id = track["track_id"]
+        class_name = track.get("class_name", "Vehicle")
+        
+        color = emitting_color if track_id in emitting_master_ids else normal_color
+        
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        label = f"{class_name} ID:{track_id}"
+        if track_id in emitting_master_ids:
+            label += " (EMITTING)"
+            
+        label_y = max(18, y1 - 6)
+        
+        cv2.putText(
+            annotated,
+            label,
+            (x1, label_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    return annotated

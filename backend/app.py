@@ -5,6 +5,9 @@ from .config import (
 
 from .models import (
     load_yolo_model, 
+    load_vehicle_model,
+    load_license_plate_model,
+    load_ocr_reader,
     load_florence_model, 
     ModelNotFoundError,
 )
@@ -16,6 +19,7 @@ from .drawing import (
     draw_detections, 
     draw_inference_boxes, 
     draw_fast_video_detections,
+    draw_vehicle_tracks,
 )
 
 from .utils import (
@@ -28,10 +32,6 @@ from .video_pipeline import (
     create_video_report_frame_folder,
     save_video_report_frame,
     get_video_frame_stride,
-    find_recent_smoke_source,
-    captions_look_like_same_vehicle,
-    copy_previous_classification,
-    remember_smoke_source,
     create_video_writer,
     build_smoke_event,
 )

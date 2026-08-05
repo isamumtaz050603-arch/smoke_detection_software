@@ -1,17 +1,88 @@
+# ==========================
+# Virtual Environments
+# ==========================
+venv/
 .venv/
+env/
+
+# ==========================
+# Python
+# ==========================
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 
-.streamlit/secrets.toml
+# ==========================
+# Environment Variables
+# ==========================
 .env
+.env.*
 
+# ==========================
+# Streamlit
+# ==========================
+.streamlit/secrets.toml
+
+# ==========================
+# IDE Files
+# ==========================
+.vscode/
+.idea/
+
+# ==========================
+# Operating System Files
+# ==========================
+.DS_Store
+Thumbs.db
+
+# ==========================
+# Runtime / Cache
+# ==========================
 outputs/
 support/cache_files/
 support/old_runtime_files/
 
+# ==========================
+# Logs
+# ==========================
+*.log
+
+# ==========================
+# Reports / Generated Files
+# ==========================
+*.csv
+
+# ==========================
+# Large Model Weights & Cache
+# ==========================
 models/florence2_smoke_classifier/*.bin
 models/florence2_smoke_classifier/*.safetensors
 
+# ==========================
+# Documents (Temporary)
+# ==========================
 ~$*.docx
+
+# ==========================
+# Python Build Files
+# ==========================
+build/
+dist/
+*.egg-info/
+
+# ==========================
+# Pytest / Coverage
+# ==========================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ==========================
+# Jupyter
+# ==========================
+.ipynb_checkpoints/
+
+# ==========================
+# Ultralytics Settings
+# ==========================
+support/runtime/ultralytics/Ultralytics/settings.json
