@@ -40,7 +40,8 @@ class SmokeDetectionEngine:
         self.local_to_master_id = {} # Local YOLO ID -> Master Track ID
         self.unreadable_cache = set() # Master Track IDs that failed ANPR
         import collections
-        self.track_history_buffer = collections.defaultdict(lambda: collections.deque(maxlen=30))
+        self.track_history_buffer = collections.defaultdict(lambda: collections.deque(maxlen=150))
+        self.global_frame_history = collections.deque(maxlen=150)
 
     def prepare_florence_inputs(self, inputs):
         """
@@ -172,6 +173,8 @@ class SmokeDetectionEngine:
                 "track_id": master_id,
                 "class_name": class_name,
             })
+        
+        self.global_frame_history.append(tracks)
         return tracks
 
     def get_plate_for_track(self, track_id):
@@ -183,19 +186,27 @@ class SmokeDetectionEngine:
             return "UNREADABLE"
 
         # FAST PATH CACHE: Return immediately if we already know the plate
-        for known_plate, master_id in self.global_vehicle_map.items():
-            if master_id == track_id:
-                return known_plate
+        for known_plate, data in self.global_vehicle_map.items():
+            if data[0] == track_id:
+                return known_plate, data[1]
 
         # UNREADABLE CACHE: Don't repeatedly scan tracks that already failed
         if track_id in self.unreadable_cache:
-            return "UNREADABLE"
+            return "UNREADABLE", None
 
-        # Search backwards (most recent frame first), limit to 5 frames
+        # Check all available history frames, sorted by bounding box area (largest/closest first)
         history = list(self.track_history_buffer.get(track_id, []))
-        history_to_check = history[-5:] if len(history) >= 5 else history
         
-        for entry in reversed(history_to_check):
+        def get_area(entry):
+            x1, y1, x2, y2 = entry['bbox']
+            return (x2 - x1) * (y2 - y1)
+            
+        history_to_check = sorted(history, key=get_area, reverse=True)
+        
+        best_plate_text = ""
+        best_vehicle_crop = None
+        
+        for entry in history_to_check:
             vehicle_crop = entry['crop']
             if vehicle_crop.size == 0:
                 continue
@@ -214,39 +225,92 @@ class SmokeDetectionEngine:
             px1, py1, px2, py2 = map(int, best_plate_box.xyxy[0].cpu().numpy())
             plate_crop = vehicle_crop[py1:py2, px1:px2]
             
-            ocr_results = self.ocr_reader.readtext(plate_crop, detail=0)
+            ocr_results = self.ocr_reader.readtext(
+                plate_crop, 
+                detail=0,
+                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -',
+                mag_ratio=2
+            )
             if not ocr_results:
                 continue
                 
             # Join text if multiple blocks are found
-            plate_text = "".join(ocr_results).replace(" ", "").upper()
-            if len(plate_text) >= 3:
-                # Fuzzy Match
-                best_match = None
-                best_ratio = 0.0
+            plate_text = "".join(ocr_results).replace(" ", "").replace("-", "").upper()
+            
+            # Keep the longest and most complete plate read
+            if len(plate_text) > len(best_plate_text):
+                best_plate_text = plate_text
+                best_vehicle_crop = vehicle_crop
                 
-                for known_plate, master_id in self.global_vehicle_map.items():
-                    ratio = difflib.SequenceMatcher(None, plate_text, known_plate).ratio()
-                    if ratio > best_ratio:
-                        best_ratio = ratio
-                        best_match = master_id
-                        
-                if best_ratio > 0.85:
-                    # It's an existing vehicle (link broken tracks)
-                    self.local_to_master_id[track_id] = best_match
-                    return known_plate
-                else:
-                    # It's a new vehicle
-                    self.global_vehicle_map[plate_text] = track_id
-                    return plate_text
+            # If we found a solidly long plate, we can stop early to save CPU
+            if len(best_plate_text) >= 6:
+                break
+                
+        if len(best_plate_text) >= 3:
+            # Fuzzy Match
+            best_match_id = None
+            best_match_crop = None
+            best_ratio = 0.0
+            
+            for known_plate, data in self.global_vehicle_map.items():
+                ratio = difflib.SequenceMatcher(None, best_plate_text, known_plate).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_match_id = data[0]
+                    best_match_crop = data[1]
                     
+            if best_ratio > 0.85:
+                # It's an existing vehicle (link broken tracks)
+                self.local_to_master_id[track_id] = best_match_id
+                return known_plate, best_match_crop
+            else:
+                # It's a new vehicle
+                self.global_vehicle_map[best_plate_text] = (track_id, best_vehicle_crop)
+                return best_plate_text, best_vehicle_crop
+                
+        # If we reached here, the plate was completely unreadable for this track_id.
+        # Track Stitching Fallback: 
+        # If this is a new broken track (new ID, short history), search the global history 
+        # for an older track ID that spatially overlaps with where this vehicle first appeared!
+        if history:
+            oldest_crop_entry = history[0] # The very first time we saw this track_id
+            ox1, oy1, ox2, oy2 = oldest_crop_entry['bbox']
+            
+            for past_tracks in reversed(list(self.global_frame_history)):
+                for vehicle in past_tracks:
+                    past_id = vehicle['track_id']
+                    
+                    # Ignore itself, and ignore tracks we already know are unreadable
+                    if past_id != track_id and past_id not in self.unreadable_cache:
+                        vx1, vy1, vx2, vy2 = vehicle['xyxy']
+                        
+                        # Calculate Intersection over Union (IoU)
+                        ix1 = max(ox1, vx1)
+                        iy1 = max(oy1, vy1)
+                        ix2 = min(ox2, vx2)
+                        iy2 = min(oy2, vy2)
+                        
+                        intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                        if intersection > 0:
+                            area1 = (ox2 - ox1) * (oy2 - oy1)
+                            area2 = (vx2 - vx1) * (vy2 - vy1)
+                            iou = intersection / float(area1 + area2 - intersection)
+                            
+                            if iou > 0.5: # 50% spatial overlap means it's almost certainly the same car
+                                # We found the ghost of the previous track ID!
+                                # Let's steal its license plate.
+                                stitched_plate, stitched_crop = self.get_plate_for_track(past_id)
+                                if stitched_plate != "UNREADABLE":
+                                    self.local_to_master_id[track_id] = past_id
+                                    return stitched_plate, stitched_crop
+
         self.unreadable_cache.add(track_id)
-        return "UNREADABLE"
+        return "UNREADABLE", None
 
     # ------------------------------------------------------------------
     # Association: Link Smoke to Vehicles
     # ------------------------------------------------------------------
-    def associate_smoke_to_vehicles(self, smoke_detections, vehicle_tracks):
+    def associate_smoke_to_vehicles(self, smoke_detections, vehicle_tracks, lookback_frames=15):
         """
         Associates smoke boxes to master vehicle IDs based on a Spatial Composite Score.
         """
@@ -306,13 +370,16 @@ class SmokeDetectionEngine:
                 fallback_master_id = None
                 fallback_class_name = None
                 
-                for master_id, history in self.track_history_buffer.items():
-                    for entry in reversed(list(history)):
-                        vx1, vy1, vx2, vy2 = entry['bbox']
-                        vx1_expanded = vx1 - 150
-                        vy1_expanded = vy1 - 50
-                        vx2_expanded = vx2 + 150
-                        vy2_expanded = vy2 + 150
+                history_list = list(self.global_frame_history)
+                frames_to_check = history_list[-lookback_frames:] if lookback_frames > 0 else []
+                
+                for past_tracks in reversed(frames_to_check):
+                    for vehicle in past_tracks:
+                        vx1, vy1, vx2, vy2 = vehicle['xyxy']
+                        vx1_expanded = vx1 - 250
+                        vy1_expanded = vy1 - 100
+                        vx2_expanded = vx2 + 250
+                        vy2_expanded = vy2 + 250
                         
                         ix1 = max(sx1, vx1_expanded)
                         iy1 = max(sy1, vy1_expanded)
@@ -328,11 +395,14 @@ class SmokeDetectionEngine:
                         
                         composite_score = (0.6 * ios) + (0.4 * (1.0 / (1.0 + (box_distance / 10.0))))
                         
-                        if composite_score > fallback_best_score and composite_score > 0.15:
+                        if composite_score > fallback_best_score and composite_score > 0.08:
                             fallback_best_score = composite_score
-                            fallback_master_id = master_id
-                            fallback_class_name = entry['class_name']
-                            break # Move to next master_id since we found best match in its history
+                            fallback_master_id = vehicle['track_id']
+                            fallback_class_name = vehicle['class_name']
+                    
+                    if fallback_master_id is not None:
+                        break # Found best match in the most recent valid past frame
+                            
                             
                 if fallback_master_id is not None:
                     smoke['associated_master_id'] = fallback_master_id

@@ -987,6 +987,11 @@ with settings_panel:
             min_value=2, max_value=15, value=5, step=1,
             help="Higher FPS increases AI load but improves tracking accuracy.",
         )
+        track_lookback_frames = st.slider(
+            "Vehicle Track Lookback (Frames)",
+            min_value=0, max_value=30, value=15, step=1,
+            help="If a smoking vehicle exits before smoke is detected, look back this many frames to identify it.",
+        )
 
     tracker_type = st.radio("Vehicle Tracking", ["None", "ByteTrack", "BoT-SORT"], index=2)
     mode = st.radio("Input Mode", ["Image", "Video"])
@@ -1385,7 +1390,7 @@ with workspace_panel:
                             last_vehicle_tracks = engine.track_vehicles(frame)
                             
                             if last_detections:
-                                last_detections = engine.associate_smoke_to_vehicles(last_detections, last_vehicle_tracks)
+                                last_detections = engine.associate_smoke_to_vehicles(last_detections, last_vehicle_tracks, lookback_frames=track_lookback_frames)
                                 for d in last_detections:
                                     if d.get('associated_master_id') is not None:
                                         valid_smoke_detections.append(d)
@@ -1404,7 +1409,7 @@ with workspace_panel:
                                     continue
                                     
                                 test_dets = [candidate['detection']]
-                                updated_dets = engine.associate_smoke_to_vehicles(test_dets, last_vehicle_tracks)
+                                updated_dets = engine.associate_smoke_to_vehicles(test_dets, last_vehicle_tracks, lookback_frames=track_lookback_frames)
                                 updated_d = updated_dets[0]
                                 
                                 if updated_d.get('associated_master_id') is not None:
@@ -1436,8 +1441,15 @@ with workspace_panel:
                                 raw_master_id = d.get('associated_master_id')
                                 
                                 if raw_master_id is not None:
-                                    raw_plate = engine.get_plate_for_track(raw_master_id)
+                                    plate_result = engine.get_plate_for_track(raw_master_id)
+                                    if isinstance(plate_result, tuple):
+                                        raw_plate, plate_crop = plate_result
+                                    else:
+                                        raw_plate = plate_result
+                                        plate_crop = None
+                                    
                                     d['associated_plate'] = raw_plate
+                                    d['associated_crop'] = plate_crop
                                 else:
                                     raw_plate = None
                                 
@@ -1476,7 +1488,28 @@ with workspace_panel:
                                 if config.tracker_type != "None" and last_vehicle_tracks:
                                     rep_emitting_ids = set([d.get('associated_master_id') for d in report_detections if d.get('associated_master_id') is not None])
                                     report_frame = backend.draw_vehicle_tracks(report_frame, last_vehicle_tracks, rep_emitting_ids)
-                                
+                                    
+                                # OVERLAY PICTURE-IN-PICTURE ANPR CROP
+                                import cv2
+                                for d in report_detections:
+                                    pc = d.get('associated_crop')
+                                    if pc is not None:
+                                        try:
+                                            h, w = pc.shape[:2]
+                                            new_w = 250
+                                            new_h = int(h * (new_w / w))
+                                            pc_resized = cv2.resize(pc, (new_w, new_h))
+                                            
+                                            fh, fw = report_frame.shape[:2]
+                                            y_offset = 40
+                                            x_offset = fw - new_w - 20
+                                            
+                                            report_frame[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = pc_resized
+                                            cv2.rectangle(report_frame, (x_offset, y_offset), (x_offset+new_w, y_offset+new_h), (0, 255, 0), 2)
+                                            cv2.putText(report_frame, f"ANPR Source:", (x_offset, y_offset - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                                        except Exception as e:
+                                            pass # Skip PiP if geometry fails
+                                            
                                 report_frame_path = backend.save_video_report_frame(
                                     report_frame,
                                     report_frame_folder,
