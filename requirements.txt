@@ -25,3 +25,5 @@ altair
 requests
 pyyaml
 tqdm
+timm
+einops
