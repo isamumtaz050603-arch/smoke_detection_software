@@ -27,3 +27,5 @@ pyyaml
 tqdm
 timm
 einops
+streamlit-webrtc
+av

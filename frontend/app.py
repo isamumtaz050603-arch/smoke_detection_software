@@ -19,6 +19,7 @@ import re
 import difflib
 import csv
 import threading
+import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 import cv2
@@ -994,7 +995,7 @@ with settings_panel:
         )
 
     tracker_type = st.radio("Vehicle Tracking", ["None", "ByteTrack", "BoT-SORT"], index=2)
-    mode = st.radio("Input Mode", ["Image", "Video"])
+    mode = st.radio("Input Mode", ["Image", "Video", "Webcam Stream"])
     st.markdown(
         f"""
         <div class="sidebar-status-card">
@@ -1032,6 +1033,10 @@ engine = backend.SmokeDetectionEngine(
     license_plate_model=license_plate_model,
     ocr_reader=ocr_reader,
 )
+
+# Force PyTorch to pre-allocate CUDA memory before the video starts 
+# so it doesn't freeze the video stream on the first real detection
+engine.warmup_models()
 
 
 # -----------------------------------------------
@@ -1363,7 +1368,7 @@ with workspace_panel:
                         csv_writer = csv.writer(f)
                         csv_writer.writerow(["Timestamp", "Master Vehicle ID", "Vehicle Type", "License Plate", "Smoke Color", "Severity Level"])
 
-                max_workers_count = 4 if torch.cuda.is_available() else 2
+                max_workers_count = 1 # Force sequential execution to prevent PyTorch CUDA deadlocks when multiple vehicles emit smoke simultaneously
                 classification_executor = ThreadPoolExecutor(max_workers=max_workers_count)
                 classification_futures = []
                 last_report_second = -999.0
@@ -1372,62 +1377,112 @@ with workspace_panel:
                 display_update_stride = max(1, int(round(fps / 5)))
                 pending_smoke_candidates = []
 
-                while cap.isOpened():
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
 
-                    should_analyze = frame_count % frame_stride == 0
-                    if should_analyze:
-                        smoke_start = time.perf_counter()
-                        last_detections = engine.detect_smoke_boxes(frame)
-                        smoke_inference_ms = (time.perf_counter() - smoke_start) * 1000
-                        smoke_inference_times.append(smoke_inference_ms)
-                        analysis_second = frame_count / fps
-                        
-                        valid_smoke_detections = []
-                        if config.tracker_type != "None":
-                            last_vehicle_tracks = engine.track_vehicles(frame)
+                frame_queue = queue.Queue(maxsize=30)
+                
+                def video_reader_thread():
+                    local_frame_count = 0
+                    pending_smoke_candidates = []
+                    local_last_tracks = []
+                    local_last_detections = []
+                    local_detection_checks = 0
+                    
+                    try:
+                        while cap.isOpened():
+                            ret, frame = cap.read()
+                            if not ret:
+                                break
                             
-                            if last_detections:
-                                last_detections = engine.associate_smoke_to_vehicles(last_detections, last_vehicle_tracks, lookback_frames=track_lookback_frames)
-                                for d in last_detections:
-                                    if d.get('associated_master_id') is not None:
-                                        valid_smoke_detections.append(d)
-                                    else:
-                                        pending_smoke_candidates.append({
-                                            'detection': d,
-                                            'frame_count': frame_count,
-                                            'analysis_second': analysis_second,
-                                            'frame': frame.copy()
-                                        })
-                                        
-                            still_pending = []
-                            for candidate in pending_smoke_candidates:
-                                frames_elapsed = frame_count - candidate['frame_count']
-                                if frames_elapsed > 15:
-                                    continue
-                                    
-                                test_dets = [candidate['detection']]
-                                updated_dets = engine.associate_smoke_to_vehicles(test_dets, last_vehicle_tracks, lookback_frames=track_lookback_frames)
-                                updated_d = updated_dets[0]
+                            should_analyze = local_frame_count % frame_stride == 0
+                            valid_smoke_detections = []
+                            smoke_inference_ms = 0
+                            
+                            if should_analyze:
+                                smoke_start = time.perf_counter()
+                                local_last_detections = engine.detect_smoke_boxes(frame)
+                                smoke_inference_ms = (time.perf_counter() - smoke_start) * 1000
+                                analysis_second = local_frame_count / fps
                                 
-                                if updated_d.get('associated_master_id') is not None:
-                                    candidate['detection'] = updated_d
-                                    valid_smoke_detections.append(updated_d)
+                                if config.tracker_type != "None":
+                                    local_last_tracks = engine.track_vehicles(frame)
+                                    
+                                    if local_last_detections:
+                                        local_last_detections = engine.associate_smoke_to_vehicles(local_last_detections, local_last_tracks, lookback_frames=track_lookback_frames)
+                                        for d in local_last_detections:
+                                            if d.get('associated_master_id') is not None:
+                                                valid_smoke_detections.append(d)
+                                            else:
+                                                pending_smoke_candidates.append({
+                                                    'detection': d,
+                                                    'frame_count': local_frame_count,
+                                                    'analysis_second': analysis_second,
+                                                    'frame': frame.copy()
+                                                })
+                                                
+                                    still_pending = []
+                                    for candidate in pending_smoke_candidates:
+                                        frames_elapsed = local_frame_count - candidate['frame_count']
+                                        if frames_elapsed > 15:
+                                            continue
+                                            
+                                        test_dets = [candidate['detection']]
+                                        updated_dets = engine.associate_smoke_to_vehicles(test_dets, local_last_tracks, lookback_frames=track_lookback_frames)
+                                        updated_d = updated_dets[0]
+                                        
+                                        if updated_d.get('associated_master_id') is not None:
+                                            candidate['detection'] = updated_d
+                                            valid_smoke_detections.append(updated_d)
+                                        else:
+                                            still_pending.append(candidate)
+                                    pending_smoke_candidates = still_pending
+                                    
                                 else:
-                                    still_pending.append(candidate)
-                            pending_smoke_candidates = still_pending
+                                    if local_last_detections:
+                                        for d in local_last_detections:
+                                            d['associated_master_id'] = None
+                                            d['associated_class_name'] = None
+                                            d['associated_plate'] = None
+                                            valid_smoke_detections.append(d)
+                                
+                                local_detection_checks += 1
                             
-                        else:
-                            if last_detections:
-                                for d in last_detections:
-                                    d['associated_master_id'] = None
-                                    d['associated_class_name'] = None
-                                    d['associated_plate'] = None
-                                    valid_smoke_detections.append(d)
-
-                        detection_checks += 1
+                            frame_queue.put({
+                                "frame": frame,
+                                "frame_count": local_frame_count,
+                                "last_detections": local_last_detections,
+                                "last_vehicle_tracks": local_last_tracks,
+                                "valid_smoke_detections": valid_smoke_detections,
+                                "should_analyze": should_analyze,
+                                "inference_ms": smoke_inference_ms,
+                                "detection_checks": local_detection_checks
+                            })
+                            local_frame_count += 1
+                        
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                    finally:
+                        cap.release()
+                        frame_queue.put(None)
+                
+                threading.Thread(target=video_reader_thread, daemon=True).start()
+                
+                while True:
+                    item = frame_queue.get()
+                    if item is None:
+                        break
+                    
+                    frame = item["frame"]
+                    frame_count = item["frame_count"]
+                    last_detections = item["last_detections"]
+                    last_vehicle_tracks = item["last_vehicle_tracks"]
+                    valid_smoke_detections = item["valid_smoke_detections"]
+                    should_analyze = item["should_analyze"]
+                    detection_checks = item["detection_checks"]
+                    
+                    if should_analyze:
+                        smoke_inference_times.append(item["inference_ms"])
+                        analysis_second = frame_count / fps
 
                         should_add_report = (
                             bool(valid_smoke_detections)
@@ -1435,27 +1490,13 @@ with workspace_panel:
                         )
                         
                         if should_add_report:
-                            # Apply Deduplication Guards (Strict Check)
+                            # Apply Deduplication Guards (Fast Strict Check)
                             new_smoke_detections = []
                             for d in valid_smoke_detections:
                                 raw_master_id = d.get('associated_master_id')
-                                
-                                if raw_master_id is not None:
-                                    plate_result = engine.get_plate_for_track(raw_master_id)
-                                    if isinstance(plate_result, tuple):
-                                        raw_plate, plate_crop = plate_result
-                                    else:
-                                        raw_plate = plate_result
-                                        plate_crop = None
-                                    
-                                    d['associated_plate'] = raw_plate
-                                    d['associated_crop'] = plate_crop
-                                else:
-                                    raw_plate = None
+                                vehicle_class = d.get('associated_class_name')
                                 
                                 master_id_str = str(raw_master_id) if raw_master_id is not None else "UNASSOCIATED_SMOKE"
-                                plate_str = str(raw_plate).upper() if raw_plate is not None else None
-                                vehicle_class = d.get('associated_class_name')
                                 
                                 skip = False
                                 
@@ -1466,87 +1507,86 @@ with workspace_panel:
                                 # Guard 1: Master ID Check
                                 if not skip and master_id_str in reported_vids:
                                     skip = True
-                                    
-                                # Guard 2: Global License Plate Deduplication (Fuzzy Check)
-                                if not skip and plate_str is not None and plate_str != "UNREADABLE" and plate_str != "NONE":
-                                    for known_plate in list(reported_plates.keys()):
-                                        if difflib.SequenceMatcher(None, plate_str, known_plate).ratio() > 0.85:
-                                            skip = True
-                                            break
                                             
                                 if not skip:
                                     # FIX CACHE INJECTION RACE CONDITIONS: Instantly add to caches in main thread!
                                     if master_id_str is not None:
                                         reported_vids[master_id_str] = True
-                                    if plate_str is not None and plate_str != "UNREADABLE" and plate_str != "NONE":
-                                        reported_plates[plate_str] = True
                                     new_smoke_detections.append(d)
                             
                             if new_smoke_detections:
                                 report_detections = copy.deepcopy(new_smoke_detections)
-                                report_frame = backend.draw_fast_video_detections(frame, report_detections)
-                                if config.tracker_type != "None" and last_vehicle_tracks:
-                                    rep_emitting_ids = set([d.get('associated_master_id') for d in report_detections if d.get('associated_master_id') is not None])
-                                    report_frame = backend.draw_vehicle_tracks(report_frame, last_vehicle_tracks, rep_emitting_ids)
+                                frame_copy = frame.copy()
+                                tracks_copy = copy.deepcopy(last_vehicle_tracks)
+
+                                def background_classification(detections_copy, frame_img, tracks_img, f_count, v_fps, src, r_folder, a_sec):
+                                    c_start = time.perf_counter()
                                     
-                                # OVERLAY PICTURE-IN-PICTURE ANPR CROP
-                                import cv2
-                                for d in report_detections:
-                                    pc = d.get('associated_crop')
-                                    if pc is not None:
+                                    # 1. Do ANPR in background to prevent stutter
+                                    first_det = detections_copy[0]
+                                    raw_master_id = first_det.get('associated_master_id')
+                                    rep_class = first_det.get('associated_class_name', 'Unknown')
+                                    
+                                    rep_plate = "UNREADABLE"
+                                    plate_crop = None
+                                    if raw_master_id is not None:
+                                        plate_result = engine.get_plate_for_track(raw_master_id)
+                                        if isinstance(plate_result, tuple):
+                                            rep_plate, plate_crop = plate_result
+                                        else:
+                                            rep_plate = plate_result
+                                            
+                                    plate_str = str(rep_plate).upper() if rep_plate is not None else None
+                                    
+                                    # 2. Guard 2: Global License Plate Deduplication (Fuzzy Check)
+                                    if plate_str is not None and plate_str != "UNREADABLE" and plate_str != "NONE":
+                                        for known_plate in list(reported_plates.keys()):
+                                            if difflib.SequenceMatcher(None, plate_str, known_plate).ratio() > 0.85:
+                                                # Duplicate vehicle from ANPR, abort classification!
+                                                return None
+                                        reported_plates[plate_str] = True
+
+                                    # 3. Draw Report Frame and Save
+                                    report_f = backend.draw_fast_video_detections(frame_img, detections_copy)
+                                    if config.tracker_type != "None" and tracks_img:
+                                        rep_emitting_ids = set([d.get('associated_master_id') for d in detections_copy if d.get('associated_master_id') is not None])
+                                        report_f = backend.draw_vehicle_tracks(report_f, tracks_img, rep_emitting_ids)
+                                        
+                                    if plate_crop is not None:
+                                        import cv2
                                         try:
-                                            h, w = pc.shape[:2]
+                                            h, w = plate_crop.shape[:2]
                                             new_w = 250
                                             new_h = int(h * (new_w / w))
-                                            pc_resized = cv2.resize(pc, (new_w, new_h))
+                                            pc_resized = cv2.resize(plate_crop, (new_w, new_h))
                                             
-                                            fh, fw = report_frame.shape[:2]
+                                            fh, fw = report_f.shape[:2]
                                             y_offset = 40
                                             x_offset = fw - new_w - 20
                                             
-                                            report_frame[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = pc_resized
-                                            cv2.rectangle(report_frame, (x_offset, y_offset), (x_offset+new_w, y_offset+new_h), (0, 255, 0), 2)
-                                            cv2.putText(report_frame, f"ANPR Source:", (x_offset, y_offset - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                                        except Exception as e:
-                                            pass # Skip PiP if geometry fails
+                                            report_f[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = pc_resized
+                                            cv2.rectangle(report_f, (x_offset, y_offset), (x_offset+new_w, y_offset+new_h), (0, 255, 0), 2)
+                                            cv2.putText(report_f, f"ANPR Source:", (x_offset, y_offset - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                                        except Exception:
+                                            pass
                                             
-                                report_frame_path = backend.save_video_report_frame(
-                                    report_frame,
-                                    report_frame_folder,
-                                    frame_count,
-                                    analysis_second,
-                                )
-                                
-                                # Assuming all new_smoke_detections share the same master_id/plate if they belong to the same frame
-                                # (Or we can process them individually, but build_smoke_event takes a list of detections)
-                                # We'll just take the first one's master info for the row representation
-                                first_det = report_detections[0]
-                                rep_master_id = first_det.get('associated_master_id', 'UNKNOWN')
-                                rep_plate = first_det.get('associated_plate', 'UNREADABLE')
-                                rep_class = first_det.get('associated_class_name', 'Unknown')
-
-                                def background_classification(detections_copy, frame_num, video_fps, source, frame_path, analysis_sec, master_id, plate, v_class):
-                                    c_start = time.perf_counter()
-                                    # Since they passed guards, we skip recent_smoke_sources check entirely
-                                    # and go straight to VLM classification!
-                                    classified = engine.classify_detected_smoke(detections_copy)
-                                    
-                                    # Since describe_frame_with_vlm is no longer strictly needed for deduplication,
-                                    # we just use the classified colors to build the event
-                                    c_time = time.perf_counter() - c_start
-                                    event = backend.build_smoke_event(
-                                        frame_num,
-                                        video_fps,
-                                        classified,
-                                        source_name=source,
-                                        classification_time_seconds=c_time,
-                                        frame_image_path=frame_path,
+                                    report_frame_path = backend.save_video_report_frame(
+                                        report_f, r_folder, f_count, a_sec
                                     )
-                                    event["Frame Caption"] = f"Detected {v_class}"
+
+                                    # 4. VLM Classification
+                                    classified = engine.classify_detected_smoke(detections_copy)
+                                    c_time = time.perf_counter() - c_start
+                                    
+                                    event = backend.build_smoke_event(
+                                        f_count, v_fps, classified, source_name=src, 
+                                        classification_time_seconds=c_time, frame_image_path=report_frame_path
+                                    )
+                                    event["Frame Caption"] = f"Detected {rep_class}"
                                     event["Report Type"] = "New vehicle/source"
-                                    event["Master ID"] = master_id
-                                    event["Vehicle Type"] = v_class
-                                    event["License Plate"] = plate
+                                    event["Master ID"] = raw_master_id
+                                    event["Vehicle Type"] = rep_class
+                                    event["License Plate"] = rep_plate
                                     
                                     # Log to CSV
                                     import datetime
@@ -1557,21 +1597,20 @@ with workspace_panel:
                                     with csv_lock:
                                         with open("cctv_report.csv", "a", newline="") as f:
                                             csv_writer = csv.writer(f)
-                                            csv_writer.writerow([timestamp_str, master_id, v_class, plate, smoke_color, severity])
+                                            csv_writer.writerow([timestamp_str, raw_master_id, rep_class, rep_plate, smoke_color, severity])
                                             
-                                    return event, c_time, classified, event["Frame Caption"], "New vehicle/source", analysis_sec
+                                    return event
 
                                 future = classification_executor.submit(
-                                    background_classification,
-                                    report_detections,
-                                    frame_count,
-                                    fps,
-                                    uploaded_video.name,
-                                    report_frame_path,
-                                    analysis_second,
-                                    rep_master_id,
-                                    rep_plate,
-                                    rep_class
+                                    background_classification, 
+                                    report_detections, 
+                                    frame_copy,
+                                    tracks_copy,
+                                    frame_count, 
+                                    fps, 
+                                    uploaded_video.name, 
+                                    report_frame_folder, 
+                                    analysis_second
                                 )
                                 classification_futures.append(future)
                                 saved_report_frames += 1
@@ -1580,17 +1619,20 @@ with workspace_panel:
                         display_status_slot.markdown(backend.render_display_status(last_detections), unsafe_allow_html=True)
 
                     completed_futures = [future for future in classification_futures if future.done()]
-                    if completed_futures:
-                        for future in completed_futures:
-                            event, c_time, classified_detections, vehicle_caption, report_type, analysis_sec = future.result()
-                            if report_type == "New vehicle/source":
-                                smoke_events.append(event)
-                                video_detection_rows.append(event)
-                            smoke_classification_times.append(c_time)
-                            
-                            with detection_table_slot.container():
-                                show_video_detection_frame_table(video_detection_rows)
-                            classification_futures.remove(future)
+                    for future in completed_futures:
+                        try:
+                            ev = future.result()
+                            if ev is not None:
+                                smoke_events.append(ev)
+                                video_detection_rows.append(ev)
+                                smoke_classification_times.append(ev["Classification Time (s)"])
+                                
+                                with detection_table_slot.container():
+                                    show_video_detection_frame_table(video_detection_rows)
+                        except Exception as e:
+                            import traceback
+                            traceback.print_exc()
+                        classification_futures.remove(future)
 
                     if len(smoke_events) > last_rendered_events_count:
                         smoke_events.sort(key=lambda item: item.get("Video Seconds", 0.0))
@@ -1639,7 +1681,6 @@ with workspace_panel:
                             unsafe_allow_html=True,
                         )
 
-                cap.release()
                 writer.release()
 
                 if classification_futures:
@@ -1650,14 +1691,18 @@ with workspace_panel:
                         unsafe_allow_html=True,
                     )
                     for future in as_completed(classification_futures):
-                        event, c_time, classified_detections, vehicle_caption, report_type, analysis_sec = future.result()
-                        if report_type == "New vehicle/source":
-                            smoke_events.append(event)
-                            video_detection_rows.append(event)
-                        smoke_classification_times.append(c_time)
-                        
-                        with detection_table_slot.container():
-                            show_video_detection_frame_table(video_detection_rows)
+                        try:
+                            ev = future.result()
+                            if ev is not None:
+                                smoke_events.append(ev)
+                                video_detection_rows.append(ev)
+                                smoke_classification_times.append(ev["Classification Time (s)"])
+                                
+                                with detection_table_slot.container():
+                                    show_video_detection_frame_table(video_detection_rows)
+                        except Exception as e:
+                            import traceback
+                            traceback.print_exc()
                     classification_executor.shutdown()
                     smoke_events.sort(key=lambda item: item.get("Video Seconds", 0.0))
                     with live_report_slot.container():
@@ -1695,3 +1740,10 @@ with workspace_panel:
 
                 # Keep these temp video files available for Streamlit's video player
                 # during the current session.
+
+# Explicit garbage collection to prevent Windows Python segfaults on teardown
+import gc
+import torch
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()

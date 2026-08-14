@@ -57,6 +57,50 @@ class SmokeDetectionEngine:
             prepared_inputs[key] = value
         return prepared_inputs
 
+    def warmup_models(self):
+        """
+        Runs a dummy image through all models to force PyTorch/CUDA to compile graphs 
+        and allocate memory. This prevents the Global CUDA Memory Mutex from locking 
+        and stalling the video stream during the very first real detection.
+        """
+        dummy_frame = np.zeros((640, 640, 3), dtype=np.uint8)
+        
+        # 1. Warmup YOLO Detector
+        try:
+            self.detect_smoke_boxes(dummy_frame)
+        except Exception:
+            pass
+            
+        # 2. Warmup YOLO Tracker
+        if self.vehicle_model:
+            try:
+                self.track_vehicles(dummy_frame)
+            except Exception:
+                pass
+                
+        # 3. Warmup License Plate Model
+        if self.license_plate_model:
+            try:
+                self.license_plate_model.predict(dummy_frame, verbose=False)
+            except Exception:
+                pass
+                
+        # 4. Warmup Florence-2 (This is the heavy one that causes the 5s CUDA lock)
+        if self.classifier_model:
+            try:
+                dummy_pil = Image.fromarray(dummy_frame)
+                inputs = self.classifier_processor(text=FLORENCE_CAPTION_TASK, images=dummy_pil, return_tensors="pt")
+                inputs = self.prepare_florence_inputs(inputs)
+                with torch.no_grad():
+                    self.classifier_model.generate(
+                        input_ids=inputs["input_ids"],
+                        pixel_values=inputs["pixel_values"],
+                        max_new_tokens=10,
+                        num_beams=1,
+                    )
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Detection: YOLO finds smoke boxes.
     # ------------------------------------------------------------------
@@ -177,11 +221,19 @@ class SmokeDetectionEngine:
         self.global_frame_history.append(tracks)
         return tracks
 
-    def get_plate_for_track(self, track_id):
+    def get_plate_for_track(self, track_id, visited=None):
         """
         Attempts ANPR on the current and past 5 crops of a track_id.
         Returns the recognized plate text, or 'UNREADABLE'.
         """
+        if visited is None:
+            visited = set()
+            
+        if track_id in visited:
+            return "UNREADABLE", None
+            
+        visited.add(track_id)
+
         if not self.license_plate_model or not self.ocr_reader:
             return "UNREADABLE"
 
@@ -195,7 +247,10 @@ class SmokeDetectionEngine:
             return "UNREADABLE", None
 
         # Check all available history frames, sorted by bounding box area (largest/closest first)
-        history = list(self.track_history_buffer.get(track_id, []))
+        try:
+            history = list(self.track_history_buffer.get(track_id, []))
+        except RuntimeError:
+            history = []
         
         def get_area(entry):
             x1, y1, x2, y2 = entry['bbox']
@@ -210,8 +265,10 @@ class SmokeDetectionEngine:
             vehicle_crop = entry['crop']
             if vehicle_crop.size == 0:
                 continue
-                
+            
+            # License Plate Detection (YOLO)
             plate_results = self.license_plate_model.predict(vehicle_crop, verbose=False)
+            
             if not plate_results or not plate_results[0].boxes:
                 continue
                 
@@ -231,6 +288,7 @@ class SmokeDetectionEngine:
                 allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -',
                 mag_ratio=2
             )
+            
             if not ocr_results:
                 continue
                 
@@ -276,7 +334,12 @@ class SmokeDetectionEngine:
             oldest_crop_entry = history[0] # The very first time we saw this track_id
             ox1, oy1, ox2, oy2 = oldest_crop_entry['bbox']
             
-            for past_tracks in reversed(list(self.global_frame_history)):
+            try:
+                global_hist_copy = list(self.global_frame_history)
+            except RuntimeError:
+                global_hist_copy = []
+                
+            for past_tracks in reversed(global_hist_copy):
                 for vehicle in past_tracks:
                     past_id = vehicle['track_id']
                     
@@ -299,7 +362,7 @@ class SmokeDetectionEngine:
                             if iou > 0.5: # 50% spatial overlap means it's almost certainly the same car
                                 # We found the ghost of the previous track ID!
                                 # Let's steal its license plate.
-                                stitched_plate, stitched_crop = self.get_plate_for_track(past_id)
+                                stitched_plate, stitched_crop = self.get_plate_for_track(past_id, visited=visited)
                                 if stitched_plate != "UNREADABLE":
                                     self.local_to_master_id[track_id] = past_id
                                     return stitched_plate, stitched_crop
@@ -370,7 +433,10 @@ class SmokeDetectionEngine:
                 fallback_master_id = None
                 fallback_class_name = None
                 
-                history_list = list(self.global_frame_history)
+                try:
+                    history_list = list(self.global_frame_history)
+                except RuntimeError:
+                    history_list = []
                 frames_to_check = history_list[-lookback_frames:] if lookback_frames > 0 else []
                 
                 for past_tracks in reversed(frames_to_check):
