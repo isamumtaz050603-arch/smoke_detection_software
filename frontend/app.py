@@ -1741,6 +1741,74 @@ with workspace_panel:
                 # Keep these temp video files available for Streamlit's video player
                 # during the current session.
 
+    # -----------------------------------------------
+    # WEBCAM STREAM MODE
+    # -----------------------------------------------
+    if mode == "Webcam Stream":
+        st.markdown('<div class="upload-panel-title">Live Webcam Stream</div>', unsafe_allow_html=True)
+        
+        # 1. Camera URL Input
+        camera_url = st.text_input("Camera IP / RTSP Link (use 0 for local webcam)", value="0")
+        
+        # Streamlit reads inputs as strings; convert "0" to an integer for local webcams
+        if camera_url.strip() == "0":
+            camera_url = 0
+            
+        # 2. Start/Stop Mechanism
+        col1, col2 = st.columns(2)
+        with col1:
+            start_btn = st.button("Start Stream", use_container_width=True)
+        with col2:
+            stop_btn = st.button("Stop Stream & Generate Report", use_container_width=True)
+            
+        if start_btn:
+            st.session_state["stream_running"] = True
+            st.session_state["smoke_events"] = [] # Reset events cache for a fresh report
+            st.rerun() # Ensure state updates and loop runs immediately
+            
+        if stop_btn:
+            st.session_state["stream_running"] = False
+            
+        # 3. Continuous Stream Loop Hook
+        if st.session_state.get("stream_running", False):
+            # Pass st.empty() placeholders to keep the UI Non-Blocking
+            
+            st.markdown('<div class="section-header">Live Feed</div>', unsafe_allow_html=True)
+            input_col, output_col = st.columns(2)
+            with input_col:
+                st.markdown('<div class="media-label">Live Input</div>', unsafe_allow_html=True)
+                raw_video_slot = st.empty()
+            with output_col:
+                st.markdown('<div class="media-label">Detection Output</div>', unsafe_allow_html=True)
+                display_video_slot = st.empty()
+            display_status_slot = st.empty()
+            
+            st.markdown('<div class="section-header">Event Frames</div>', unsafe_allow_html=True)
+            event_frame_slot = st.empty()
+            
+            st.markdown('<div class="section-header">Live Report</div>', unsafe_allow_html=True)
+            report_slot = st.empty()
+                
+            # Import and call our new separated core logic file
+            from backend.live_stream_handler import run_live_stream
+            
+            run_live_stream(
+                url=camera_url,
+                engine=engine,
+                config=config,
+                raw_video_slot=raw_video_slot,
+                display_video_slot=display_video_slot,
+                display_status_slot=display_status_slot,
+                event_frame_slot=event_frame_slot,
+                report_slot=report_slot,
+                session_state=st.session_state,
+                track_lookback_frames=track_lookback_frames
+            )
+            
+        # Display the collected report utilizing the existing UI render functions
+        if not st.session_state.get("stream_running", False) and st.session_state.get("smoke_events"):
+            show_live_video_report(st.session_state["smoke_events"])
+
 # Explicit garbage collection to prevent Windows Python segfaults on teardown
 import gc
 import torch
