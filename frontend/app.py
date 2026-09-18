@@ -995,7 +995,7 @@ with settings_panel:
         )
 
     tracker_type = st.radio("Vehicle Tracking", ["None", "ByteTrack", "BoT-SORT"], index=2)
-    mode = st.radio("Input Mode", ["Image", "Video", "Webcam Stream"])
+    mode = st.radio("Input Mode", ["Image", "Video", "Webcam Stream", "Multi-Camera CCTV"])
     st.markdown(
         f"""
         <div class="sidebar-status-card">
@@ -1807,6 +1807,76 @@ with workspace_panel:
             
         # Display the collected report utilizing the existing UI render functions
         if not st.session_state.get("stream_running", False) and st.session_state.get("smoke_events"):
+            show_live_video_report(st.session_state["smoke_events"])
+
+    # -----------------------------------------------
+    # MULTI-CAMERA CCTV MODE
+    # -----------------------------------------------
+    if mode == "Multi-Camera CCTV":
+        st.markdown('<div class="upload-panel-title">Multi-Camera CCTV Dashboard</div>', unsafe_allow_html=True)
+        
+        camera_urls_text = st.text_area(
+            "Enter Camera IP / RTSP Links (one per line). Use 0, 1 for local webcams.",
+            value="0"
+        )
+        urls = [u.strip() for u in camera_urls_text.split('\n') if u.strip()]
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            start_btn = st.button("Start All Streams", use_container_width=True)
+        with col2:
+            stop_btn = st.button("Stop Streams & View Final Report", use_container_width=True)
+            
+        if start_btn and urls:
+            st.session_state["multi_stream_running"] = True
+            st.session_state["smoke_events"] = []
+            st.rerun()
+            
+        if stop_btn:
+            st.session_state["multi_stream_running"] = False
+            
+        if st.session_state.get("multi_stream_running", False):
+            st.markdown('<div class="section-header">Live Feeds</div>', unsafe_allow_html=True)
+            
+            # Create a dynamic grid based on number of cameras
+            num_cams = len(urls)
+            # 2 cameras per row looks best in Streamlit
+            rows = (num_cams + 1) // 2
+            
+            display_video_slots = []
+            display_status_slots = []
+            
+            for r in range(rows):
+                cols = st.columns(2)
+                for c in range(2):
+                    idx = r * 2 + c
+                    if idx < num_cams:
+                        with cols[c]:
+                            st.markdown(f'<div class="media-label">Camera: {urls[idx]}</div>', unsafe_allow_html=True)
+                            display_video_slots.append(st.empty())
+                            display_status_slots.append(st.empty())
+            
+            st.markdown('<div class="section-header">Recent Event Frames</div>', unsafe_allow_html=True)
+            event_frame_slot = st.empty()
+            
+            st.markdown('<div class="section-header">Live Report (All Cameras)</div>', unsafe_allow_html=True)
+            report_slot = st.empty()
+            
+            from backend.multi_camera_handler import run_multi_camera_stream
+            
+            run_multi_camera_stream(
+                urls=urls,
+                base_engine=engine,
+                config=config,
+                display_video_slots=display_video_slots,
+                display_status_slots=display_status_slots,
+                event_frame_slot=event_frame_slot,
+                report_slot=report_slot,
+                session_state=st.session_state,
+                track_lookback_frames=track_lookback_frames
+            )
+            
+        if not st.session_state.get("multi_stream_running", False) and st.session_state.get("smoke_events"):
             show_live_video_report(st.session_state["smoke_events"])
 
 # Explicit garbage collection to prevent Windows Python segfaults on teardown

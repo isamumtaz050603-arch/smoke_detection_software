@@ -1,0 +1,36 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Backend Web Framework
+fastapi
+uvicorn[standard]
+websockets
+python-multipart
+
+# Core Application
+# streamlit (removed)
+
+# Computer Vision & Machine Learning
+opencv-python
+opencv-python-headless
+numpy
+pillow
+
+# Deep Learning Frameworks
+torch
+torchvision
+
+# Models
+ultralytics
+transformers==4.49.0
+easyocr
+
+# Other Dependencies
+pandas
+accelerate
+altair
+requests
+pyyaml
+tqdm
+timm
+einops
+av
