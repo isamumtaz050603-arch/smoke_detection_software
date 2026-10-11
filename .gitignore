@@ -86,3 +86,8 @@ htmlcov/
 # Ultralytics Settings
 # ==========================
 support/runtime/ultralytics/Ultralytics/settings.json
+
+# Local dependencies and generated runtime state
+node_modules/
+.next/
+support/runtime/

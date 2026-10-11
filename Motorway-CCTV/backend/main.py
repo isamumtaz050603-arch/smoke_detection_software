@@ -23,6 +23,7 @@ from backend.engine import SmokeDetectionEngine
 from backend.config import DetectionConfig, FLORENCE_MODEL_FALLBACK
 from backend.drawing import draw_fast_video_detections, draw_vehicle_tracks
 from backend.video_pipeline import build_smoke_event
+from backend.utils import detect_device
 
 app = FastAPI()
 
@@ -48,9 +49,10 @@ def initialize_engine():
     if engine_instance is not None:
         return
         
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    half = True if device == "cuda" else False
-    print(f"Initializing AI Engine on {device}...")
+    device_info = detect_device()
+    device = device_info["inference_device"]
+    half = device_info["use_half_precision"]
+    print(f"Initializing AI Engine on {device} ({device_info['device_label']})...")
     
     detector = YOLO("models/best.pt")
     vehicle_model = YOLO("yolov8n.pt") 
@@ -59,12 +61,15 @@ def initialize_engine():
     except:
         plate_model = None
         
-    ocr_reader = easyocr.Reader(['en'], gpu=(device=="cuda"))
+    ocr_reader = easyocr.Reader(['en'], gpu=device_info["use_cuda"])
     
     processor = AutoProcessor.from_pretrained(FLORENCE_MODEL_FALLBACK, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(FLORENCE_MODEL_FALLBACK, trust_remote_code=True).to(device)
-    if half:
-        model = model.half()
+    model = AutoModelForCausalLM.from_pretrained(
+        FLORENCE_MODEL_FALLBACK,
+        trust_remote_code=True,
+        torch_dtype=torch.float32,
+    ).to(device)
+    model.eval()
         
     config = DetectionConfig(tracker_type="ByteTrack", video_analysis_fps=5)
     

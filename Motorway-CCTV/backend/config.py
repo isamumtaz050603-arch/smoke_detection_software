@@ -94,6 +94,6 @@ class DetectionConfig:
     detector_conf: float = 0.50
     iou_threshold: float = 0.60
     video_analysis_fps: int = 10
-    detector_image_size: int = 512
+    detector_image_size: int = 640
     report_interval_seconds: float = 1.0
     tracker_type: str = "None"

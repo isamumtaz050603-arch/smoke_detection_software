@@ -55,7 +55,7 @@ def load_florence_model(inference_device):
     has_weights = (FLORENCE_MODEL_DIR / "model.safetensors").exists() or (FLORENCE_MODEL_DIR / "pytorch_model.bin").exists()
     model_source = str(FLORENCE_MODEL_DIR) if (FLORENCE_MODEL_DIR.exists() and has_weights) else FLORENCE_MODEL_FALLBACK
 
-    model_dtype = torch.float16 if str(inference_device).startswith("cuda") else torch.float32
+    model_dtype = torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         model_source,
         trust_remote_code=True,

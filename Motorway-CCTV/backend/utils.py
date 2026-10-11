@@ -11,19 +11,23 @@ def detect_device():
     """
     use_cuda = torch.cuda.is_available()
     inference_device = "cuda:0" if use_cuda else "cpu"
-    use_half_precision = use_cuda
+    use_half_precision = False
     device_label = torch.cuda.get_device_name(0) if use_cuda else "CPU"
     cuda_version = torch.version.cuda if use_cuda else "Not available"
+    precision_label = "FP32"
 
     if use_cuda:
-        # Small speed settings for GPU mode.
-        torch.backends.cudnn.benchmark = True
-        torch.set_float32_matmul_precision("high")
+        # Keep GPU inference in FP32 for CPU/GPU consistency.
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        torch.set_float32_matmul_precision("highest")
 
     return {
         "use_cuda": use_cuda,
         "inference_device": inference_device,
         "use_half_precision": use_half_precision,
+        "precision_label": precision_label,
         "device_label": device_label,
         "cuda_version": cuda_version,
     }

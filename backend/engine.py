@@ -46,16 +46,20 @@ class SmokeDetectionEngine:
     def prepare_florence_inputs(self, inputs):
         """
         Moves Florence inputs to the selected device.
-        On GPU, image pixels must be float16 because Florence is loaded as float16.
+        Image pixels use the same floating dtype as the Florence model.
         Text tokens stay as integer tensors.
         """
+        model_dtype = next(self.classifier_model.parameters()).dtype
         prepared_inputs = {}
         for key, value in inputs.items():
             value = value.to(self.inference_device)
-            if key == "pixel_values" and self.use_half_precision:
-                value = value.half()
+            if key == "pixel_values":
+                value = value.to(dtype=model_dtype)
             prepared_inputs[key] = value
         return prepared_inputs
+
+    def yolo_precision_args(self):
+        return {"half": True} if self.use_half_precision else {}
 
     def warmup_models(self):
         """
@@ -81,7 +85,12 @@ class SmokeDetectionEngine:
         # 3. Warmup License Plate Model
         if self.license_plate_model:
             try:
-                self.license_plate_model.predict(dummy_frame, verbose=False)
+                self.license_plate_model.predict(
+                    dummy_frame,
+                    device=self.inference_device,
+                    verbose=False,
+                    **self.yolo_precision_args(),
+                )
             except Exception:
                 pass
                 
@@ -117,9 +126,9 @@ class SmokeDetectionEngine:
             "imgsz": config.detector_image_size,
             "agnostic_nms": True, #is a YOLO setting. It removes duplicate overlapping boxes.
             "device": self.inference_device,
-            "half": self.use_half_precision,
             "verbose": False, #Should YOLO print extra details in the terminal
         }
+        predict_args.update(self.yolo_precision_args())
 
         try:
             detector_results = self.detector_model.predict(**predict_args)
@@ -128,7 +137,7 @@ class SmokeDetectionEngine:
                 raise
             torch.cuda.empty_cache()
             predict_args["device"] = "cpu"
-            predict_args["half"] = False
+            predict_args.pop("half", None)
             detector_results = self.detector_model.predict(**predict_args)
 
         boxes = detector_results[0].boxes
@@ -178,7 +187,9 @@ class SmokeDetectionEngine:
                 classes=[2, 3, 5, 7],
                 verbose=False,
                 conf=0.15, # Lower confidence to track obscured vehicles
-                iou=0.45
+                iou=0.45,
+                device=self.inference_device,
+                **self.yolo_precision_args(),
             )
         except Exception:
             return []
@@ -267,7 +278,12 @@ class SmokeDetectionEngine:
                 continue
             
             # License Plate Detection (YOLO)
-            plate_results = self.license_plate_model.predict(vehicle_crop, verbose=False)
+            plate_results = self.license_plate_model.predict(
+                vehicle_crop,
+                device=self.inference_device,
+                verbose=False,
+                **self.yolo_precision_args(),
+            )
             
             if not plate_results or not plate_results[0].boxes:
                 continue
